@@ -27,9 +27,11 @@ import numpy as np
 
 from scipy.sparse import coo_matrix
 from scipy.sparse import csr_matrix
+from classificationconfidenceintervals import ClassificationConfidenceIntervals
 
 from ..preprocessing import LabelBinarizer
 from ..preprocessing import LabelEncoder
+from ..preprocessing import OneHotEncoder
 from ..utils import assert_all_finite
 from ..utils import check_array
 from ..utils import check_consistent_length
@@ -360,7 +362,7 @@ def confusion_matrix(y_true, y_pred, *, labels=None, sample_weight=None,
 
 @_deprecate_positional_args
 def multilabel_confusion_matrix(y_true, y_pred, *, sample_weight=None,
-                                labels=None, samplewise=False):
+                                labels=None, samplewise=False, ci=None):
     """Compute a confusion matrix for each class or sample.
 
     .. versionadded:: 0.21
@@ -484,6 +486,24 @@ def multilabel_confusion_matrix(y_true, y_pred, *, sample_weight=None,
         y_pred = le.transform(y_pred)
         sorted_labels = le.classes_
 
+        if ci is not None:
+            enc = OneHotEncoder()
+            y_true_matrix = enc.fit_transform(y_true.reshape(-1, 1)).toarray()
+            y_pred_matrix = enc.transform(y_pred.reshape(-1, 1)).toarray()
+            pos_rate_cis, ppv_cis, npv_cis, recall_cis = [], [], [], []
+            ci = 0.95
+            for j in range(y_true_matrix.shape[1]):
+                class_ci = ClassificationConfidenceIntervals(
+                    sample_labels=y_true_matrix[:, j],
+                    sample_predictions=y_pred_matrix[:, j],
+                    population_size=1000000,
+                    population_flagged_count=50000,
+                    confidence_level=ci).get_cis()
+                pos_rate_cis.append(class_ci[0].tnorm_ci)
+                ppv_cis.append(class_ci[1].tnorm_ci)
+                npv_cis.append(class_ci[2].tnorm_ci)
+                recall_cis.append(class_ci[3].tnorm_ci)
+
         # labels are now from 0 to len(labels) - 1 -> use bincount
         tp = y_true == y_pred
         tp_bins = y_true[tp]
@@ -557,7 +577,10 @@ def multilabel_confusion_matrix(y_true, y_pred, *, sample_weight=None,
     else:
         tn = y_true.shape[0] - tp - fp - fn
 
-    return np.array([tn, fp, fn, tp]).T.reshape(-1, 2, 2)
+    if ci is not None:
+        return np.array([tn, fp, fn, tp]).T.reshape(-1, 2, 2), [pos_rate_cis, ppv_cis, npv_cis, recall_cis]
+    else:
+        return np.array([tn, fp, fn, tp]).T.reshape(-1, 2, 2), None
 
 
 @_deprecate_positional_args
@@ -1308,7 +1331,8 @@ def precision_recall_fscore_support(y_true, y_pred, *, beta=1.0, labels=None,
                                     warn_for=('precision', 'recall',
                                               'f-score'),
                                     sample_weight=None,
-                                    zero_division="warn"):
+                                    zero_division="warn",
+                                    ci=None):
     """Compute precision, recall, F-measure and support for each class.
 
     The precision is the ratio ``tp / (tp + fp)`` where ``tp`` is the number of
@@ -1400,6 +1424,9 @@ def precision_recall_fscore_support(y_true, y_pred, *, beta=1.0, labels=None,
 
         If set to "warn", this acts as 0, but warnings are also raised.
 
+    ci : float (between 0 and 1), default=None
+        Wether to compute confidence intervals.
+
     Returns
     -------
     precision : float (if average is not None) or array of float, shape =\
@@ -1466,9 +1493,15 @@ def precision_recall_fscore_support(y_true, y_pred, *, beta=1.0, labels=None,
 
     # Calculate tp_sum, pred_sum, true_sum ###
     samplewise = average == 'samples'
-    MCM = multilabel_confusion_matrix(y_true, y_pred,
-                                      sample_weight=sample_weight,
-                                      labels=labels, samplewise=samplewise)
+    MCM, conf_intervals = multilabel_confusion_matrix(y_true, y_pred,
+                                                      sample_weight=sample_weight,
+                                                      labels=labels, samplewise=samplewise,
+                                                      ci=ci)
+
+    if conf_intervals is not None:
+        precision_ci = conf_intervals[1]
+        recall_ci = conf_intervals[3]
+
     tp_sum = MCM[:, 1, 1]
     pred_sum = tp_sum + MCM[:, 0, 1]
     true_sum = tp_sum + MCM[:, 1, 0]
@@ -1540,7 +1573,10 @@ def precision_recall_fscore_support(y_true, y_pred, *, beta=1.0, labels=None,
         f_score = np.average(f_score, weights=weights)
         true_sum = None  # return no support
 
-    return precision, recall, f_score, true_sum
+    if ci is not None:
+        return precision, precision_ci, recall, recall_ci, f_score, true_sum
+    else:
+        return precision, recall, f_score, true_sum
 
 
 @_deprecate_positional_args
@@ -1865,7 +1901,8 @@ def balanced_accuracy_score(y_true, y_pred, *, sample_weight=None,
 @_deprecate_positional_args
 def classification_report(y_true, y_pred, *, labels=None, target_names=None,
                           sample_weight=None, digits=2, output_dict=False,
-                          zero_division="warn"):
+                          zero_division="warn",
+                          ci=None):
     """Build a text report showing the main classification metrics.
 
     Read more in the :ref:`User Guide <classification_report>`.
@@ -1900,6 +1937,9 @@ def classification_report(y_true, y_pred, *, labels=None, target_names=None,
     zero_division : "warn", 0 or 1, default="warn"
         Sets the value to return when there is a zero division. If set to
         "warn", this acts as 0, but warnings are also raised.
+
+    ci : between 0 and 1, default=None
+        Whether to calculate confidence intervals, and if so, at which level.
 
     Returns
     -------
@@ -1996,14 +2036,33 @@ def classification_report(y_true, y_pred, *, labels=None, target_names=None,
     if target_names is None:
         target_names = ['%s' % l for l in labels]
 
-    headers = ["precision", "recall", "f1-score", "support"]
+    if ci is not None:
+        headers = ["precision", "precision CI low", "precision CI high",
+                   "recall", "recall CI low", "recall CI high", "f1-score", "support"]
+    else:
+        headers = ["precision", "recall", "f1-score", "support"]
     # compute per-class results without averaging
-    p, r, f1, s = precision_recall_fscore_support(y_true, y_pred,
-                                                  labels=labels,
-                                                  average=None,
-                                                  sample_weight=sample_weight,
-                                                  zero_division=zero_division)
-    rows = zip(target_names, p, r, f1, s)
+    if ci is None:
+        p, r, f1, s = precision_recall_fscore_support(y_true, y_pred,
+                                                      labels=labels,
+                                                      average=None,
+                                                      sample_weight=sample_weight,
+                                                      zero_division=zero_division)
+        rows = zip(target_names, p, r, f1, s)
+
+    else:
+        p, p_ci, r, r_ci, f1, s = precision_recall_fscore_support(y_true, y_pred,
+                                                                  labels=labels,
+                                                                  average=None,
+                                                                  sample_weight=sample_weight,
+                                                                  zero_division=zero_division,
+                                                                  ci=ci)
+        p_ci_low = [x[0] for x in p_ci]
+        p_ci_high = [x[1] for x in p_ci]
+        r_ci_low = [x[0] for x in r_ci]
+        r_ci_high = [x[1] for x in r_ci]
+
+        rows = zip(target_names, p, p_ci_low, p_ci_high, r, r_ci_low, r_ci_high, f1, s)
 
     if y_type.startswith('multilabel'):
         average_options = ('micro', 'macro', 'weighted', 'samples')

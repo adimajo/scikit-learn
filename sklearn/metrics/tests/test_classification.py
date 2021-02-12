@@ -1005,7 +1005,8 @@ weighted avg       0.51      0.53      0.47        75
 """
     report = classification_report(
         y_true, y_pred, labels=np.arange(len(iris.target_names)),
-        target_names=iris.target_names)
+        target_names=iris.target_names,
+        ci=0.95, output_dict=True)
     assert report == expected_report
 
 
